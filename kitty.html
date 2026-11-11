@@ -493,10 +493,13 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
           <button class="btn btn-blue" data-act="syncPush">把本地推上去</button>
           <button class="btn btn-primary" data-act="syncCreate">创建云端存档</button>
         </div>
+        <label class="row mt small" style="gap:8px;align-items:center;cursor:pointer">
+          <input type="checkbox" id="syncAuto"> 自动同步（改动后约 8 秒自动推送 · 打开页面和每分钟自动拉取 · 两边同时改时以较新的为准）
+        </label>
         <div class="small muted mt" id="syncInfo"></div>
         <div class="small mt" style="color:var(--text-3);line-height:1.9">
           推荐（GitHub Gist）：① 去 github.com/settings/tokens → Generate new token (classic) → 勾选 gist → 生成后把令牌粘进 Token 框；② 点「创建云端存档」得到同步码；③ 其他设备只填同步码就能拉取（不需要 Token）。存档是私密 Gist，只有凭码能看。<br>
-          Token 只保存在你自己设备的浏览器里，不会写进云端。公共中转站只是小数据兜底（容量不到 20KB，存档可能被清理）；无论如何，本机数据 + 导出的 JSON 备份才是根本。
+          配好 Token + 同步码后，保持上方「自动同步」勾选就不用手动点了：改动约 8 秒后自动上传，打开页面及每分钟自动下载。Token 只保存在你自己设备的浏览器里，不会写进云端。公共中转站只是小数据兜底（容量不到 20KB，存档可能被清理，且不支持自动同步）；无论如何，本机数据 + 导出的 JSON 备份才是根本。
         </div>
       </div>
 
@@ -556,7 +559,7 @@ function blank(){
     version:1,
     todos:[], expenses:[], habits:[], cards:[], jobs:[],
     cats: JSON.parse(JSON.stringify(DEF_CATS)),
-    sync:{ code:'', at:'', backend:'gist', token:'' },                     // 云端同步码与最近一次同步时间
+    sync:{ code:'', at:'', backend:'gist', token:'', auto:true },           // 云端同步码与最近一次同步时间
     ui:{ todoFilter:'today' }
   };
 }
@@ -574,9 +577,10 @@ let S = (()=>{
   }catch(e){ console.warn('数据读取失败，已重置', e); return blank(); }
 })();
 
-function save(){
+function save(mark = true){
   try{ localStorage.setItem(KEY, JSON.stringify(S)); }
   catch(e){ alert('保存失败，可能是浏览器存储已满：' + e.message); }
+  if(mark && typeof markDirty === 'function') markDirty();   // 本机数据变了：记时间戳并安排自动推送
 }
 
 /* ============================================================
@@ -1143,9 +1147,12 @@ function renderSetting(){
   $('#syncBackend').value = S.sync.backend || 'gist';
   if(document.activeElement !== sc) sc.value = S.sync.code || '';
   if(document.activeElement !== st) st.value = S.sync.token || '';
+  const autoBox = $('#syncAuto');
+  if(autoBox && document.activeElement !== autoBox) autoBox.checked = S.sync.auto !== false;
   const via = S.sync.backend === 'gist' ? 'GitHub Gist' : '公共中转站';
+  const autoOn = S.sync.auto !== false;
   $('#syncInfo').textContent = S.sync.code
-    ? `同步码已记住（${S.sync.code.slice(0,10)}…，走 ${via}） · 本机最近一次同步：${S.sync.at || '还没推拉过'}`
+    ? `同步码已记住（${S.sync.code.slice(0,10)}…，走 ${via}${autoOn ? ' · 自动同步开启' : ' · 自动同步已关闭'}） · 本机最近一次同步：${S.sync.at || '还没推拉过'}`
     : '还没有云端存档：选好方式（Gist 需先填 Token），再点「创建云端存档」。';
 }
 
@@ -1159,7 +1166,12 @@ const SYNC_API = 'https://api.restful-api.dev/objects';
 const syncMsg = t => { $('#syncInfo').textContent = t; };
 const stamp = () => { const d = new Date(); const p = n => String(n).padStart(2,'0'); return `${fmtDate(d)} ${p(d.getHours())}:${p(d.getMinutes())}`; };
 const SYNC_FILENAME = 'kitty-sync.json';
-const packSync = () => ({ name:'KITTY-sync', createdAt:Date.now(), data:S });
+const packSync = () => ({
+  name:'KITTY-sync',
+  createdAt: Date.now(),
+  updatedAt: (S.sync && S.sync.changedAt) || Date.now(),   // 本机最后改动时间：自动同步靠它判断谁新谁旧
+  data: (() => { const c = JSON.parse(JSON.stringify(S)); if(c.sync) c.sync.token = ''; return c; })()   // Token 永不上云
+});
 /* ============================================================
    ⑥ 事件总线
    整个页面只绑两个监听器：click 和 change。
@@ -1385,6 +1397,10 @@ function ensureSyncFields(){
   if(!S.sync) S.sync = { code:'', at:'' };
   if(!('backend' in S.sync)) S.sync.backend = 'gist';
   if(!('token' in S.sync)) S.sync.token = '';
+  if(!('auto' in S.sync)) S.sync.auto = true;             // 自动同步开关（默认开）
+  if(!('changedAt' in S.sync)) S.sync.changedAt = 0;      // 本机最后一次改动的时间戳
+  if(!('lastSyncAt' in S.sync)) S.sync.lastSyncAt = 0;    // 本机最后一次成功同步的时间戳
+  if(!('cloudRev' in S.sync)) S.sync.cloudRev = '';       // 云端存档的 updated_at（判断云端有没有新变化）
 }
 
 async function syncCreateFn(){
@@ -1399,7 +1415,8 @@ async function syncCreateFn(){
       const d = await res.json();
       if(!d.id) throw new Error('GitHub 没有返回存档编号');
       S.sync.backend = 'gist'; S.sync.token = tk; S.sync.code = d.id; S.sync.at = stamp();
-      save(); renderSetting();
+      S.sync.cloudRev = d.updated_at || ''; S.sync.lastSyncAt = Date.now();
+      save(false); renderSetting();
       syncMsg('创建成功！同步码：' + d.id + ' —— 其他设备填这个码即可拉取（拉取不需要 Token）。');
     }catch(e){ syncMsg('创建失败：' + e.message); }
     return;
@@ -1413,7 +1430,8 @@ async function syncCreateFn(){
     const d = await res.json();
     if(!d.id) throw new Error('服务没有返回存档编号');
     S.sync.backend = 'relay'; S.sync.code = d.id; S.sync.at = stamp();
-    save(); renderSetting();
+    S.sync.lastSyncAt = Date.now();
+    save(false); renderSetting();
     syncMsg('创建成功！同步码已记在本地：' + d.id);
   }catch(e){ syncMsg('创建失败：' + e.message); }
 }
@@ -1432,7 +1450,8 @@ async function syncPushFn(){
       res = await fetch(SYNC_API + '/' + encodeURIComponent(code), { method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(packSync()) });
     }
     if(!res.ok) throw new Error(syncBackend() === 'gist' ? gistErrMsg(res.status) : res.status + '（数据太大就换 GitHub Gist）');
-    S.sync.code = code; S.sync.at = stamp(); save(); renderSetting();
+    if(syncBackend() === 'gist'){ try{ S.sync.cloudRev = (await res.json()).updated_at || S.sync.cloudRev; }catch(e){} }
+    S.sync.code = code; S.sync.at = stamp(); S.sync.lastSyncAt = Date.now(); save(false); renderSetting();
     syncMsg('已推上云端（' + S.sync.at + '）。去其他设备「从云端拉取」即可。');
   }catch(e){ syncMsg('上传失败：' + e.message); }
 }
@@ -1443,11 +1462,13 @@ async function syncPullFn(){
   if(!code){ syncMsg('先填同步码，或先「创建云端存档」。'); return; }
   syncMsg('拉取中…');
   try{
-    let res, data;
+    let res, data, gistRev = '';
     if(syncBackend() === 'gist'){
       res = await fetch(GIST_API + '/' + encodeURIComponent(code), { headers: gistHeaders(false) });
       if(!res.ok) throw new Error(gistErrMsg(res.status));
-      data = readGistPayload(await res.json());
+      const gj = await res.json();
+      gistRev = gj.updated_at || '';
+      data = readGistPayload(gj);
     }else{
       res = await fetch(SYNC_API + '/' + encodeURIComponent(code));
       if(!res.ok) throw new Error(res.status === 404 ? '存档不存在（码错了？或已被服务清理）' : 'HTTP ' + res.status);
@@ -1459,11 +1480,90 @@ async function syncPullFn(){
       ? new Date(res.headers.get('last-modified')).toLocaleString('zh-CN')
       : '未知时间';
     if(!confirm('云端最后更新：' + when + '\n本机现有：待办 ' + S.todos.length + ' 条 / 消费 ' + S.expenses.length + ' 笔。\n\n确定用云端覆盖本机数据？')){ syncMsg('已取消拉取，本机数据没动。'); return; }
+    const myTk = S.sync.token, myBackend = S.sync.backend;   // Token 是设备级的，不能被云端版本带走
     const b = blank(); Object.keys(b).forEach(k => { if(!(k in data)) data[k] = b[k]; });
     S = data; ensureSyncFields(); S.sync.code = code; S.sync.at = stamp();
-    save(); renderAll();
+    S.sync.token = myTk; S.sync.backend = myBackend;
+    if(gistRev) S.sync.cloudRev = gistRev;
+    S.sync.lastSyncAt = Date.now();
+    save(false); renderAll();
     syncMsg('拉取完成（' + S.sync.at + '），本机数据已换成云端版本。');
   }catch(e){ syncMsg('拉取失败：' + e.message); }
+}
+
+/* ============================================================
+   自动同步（仅 GitHub Gist 后端）
+   · 本机一有改动：约 8 秒后自动推送（配好 Token + 同步码才生效）
+   · 打开页面 2.5 秒后拉一次，之后每 60 秒检查一次云端
+   · 冲突规则：两边都改过时，改动时间新的赢（最后写入优先）
+   ============================================================ */
+let syncBusy = false;
+let autoPushTimer = null;
+
+function markDirty(){
+  if(!S.sync) return;
+  S.sync.changedAt = Date.now();          // 记下本机最后一次改动的时间
+  scheduleAutoPush();                     // 有 Token + 同步码时，8 秒后自动推送
+}
+
+function autoToken(){ return ($('#syncToken') && $('#syncToken').value.trim()) || S.sync.token || ''; }
+
+function scheduleAutoPush(){
+  if(!S.sync || S.sync.auto === false) return;
+  if(syncBackend() !== 'gist' || !S.sync.code || !autoToken()) return;
+  clearTimeout(autoPushTimer);
+  autoPushTimer = setTimeout(autoPush, 8000);
+}
+
+async function autoPush(){
+  if(syncBusy){ scheduleAutoPush(); return; }
+  if(!S.sync || S.sync.auto === false || !S.sync.code || !autoToken()) return;
+  syncBusy = true;
+  try{
+    const res = await fetch(GIST_API + '/' + encodeURIComponent(S.sync.code),
+      { method:'PATCH', headers: gistHeaders(true), body: JSON.stringify(gistPatchPayload()) });
+    if(!res.ok) return;                       // 失败不弹窗打扰，下次改动会再试
+    try{ S.sync.cloudRev = (await res.json()).updated_at || S.sync.cloudRev; }catch(e){}
+    S.sync.lastSyncAt = Date.now();
+    S.sync.at = stamp() + '（自动推送）';
+    save(false);
+    const vs = $('#view-setting');
+    if(vs && vs.classList.contains('on')) renderSetting();
+  }catch(e){ /* 断网等情况静默，下次改动会再试 */ }
+  finally{ syncBusy = false; }
+}
+
+async function autoPull(){
+  if(syncBusy || !navigator.onLine) return;
+  if(!S.sync || S.sync.auto === false || syncBackend() !== 'gist' || !S.sync.code) return;
+  syncBusy = true;
+  try{
+    const res = await fetch(GIST_API + '/' + encodeURIComponent(S.sync.code), { headers: gistHeaders(false) });
+    if(!res.ok) return;
+    const gj = await res.json();
+    const f = gj.files && gj.files[SYNC_FILENAME];
+    if(!f) return;
+    const parsed = JSON.parse(f.content);
+    const data = parsed && parsed.data;
+    if(!data || !Array.isArray(data.todos)) return;
+    const rev = gj.updated_at || '';
+    if(rev && S.sync.cloudRev && rev === S.sync.cloudRev) return;   // 云端没变化，不用拉
+    const cloudAt = parsed.updatedAt || parsed.createdAt || 0;
+    const localDirty = (S.sync.changedAt || 0) > (S.sync.lastSyncAt || 0);
+    if(localDirty && (S.sync.changedAt || 0) >= cloudAt){
+      scheduleAutoPush();                     // 本机改动更新，等自动推送覆盖云端即可
+      return;
+    }
+    const myTk = S.sync.token, myBackend = S.sync.backend;  // 设备级设置不能被云端版本覆盖
+    const b = blank(); Object.keys(b).forEach(k => { if(!(k in data)) data[k] = b[k]; });
+    S = data; ensureSyncFields();
+    S.sync.token = myTk; S.sync.backend = myBackend;
+    if(rev) S.sync.cloudRev = rev;
+    S.sync.changedAt = cloudAt; S.sync.lastSyncAt = Date.now();
+    S.sync.at = stamp() + '（自动拉取）';
+    save(false); renderAll();
+  }catch(e){ /* 静默，下一轮再试 */ }
+  finally{ syncBusy = false; }
 }
 
 /* 下面两行是把上面的 ACT 接到页面上 */
@@ -1487,6 +1587,11 @@ document.addEventListener('change', e => {
     ensureSyncFields();
     S.sync.backend = el.value; S.sync.code = ''; S.sync.at = '';
     save(); renderSetting();
+    return;
+  }
+  if(el.id === 'syncAuto'){                         // 自动同步开关
+    ensureSyncFields();
+    S.sync.auto = el.checked; save(); renderSetting();
     return;
   }
   if(el.id === 'syncToken'){                        // Token 只存本机
@@ -1764,6 +1869,12 @@ function init(){
     const a = ENTER[e.target.id];
     if(a && ACT[a]){ e.preventDefault(); ACT[a](); }
   });
+
+  // 自动同步：启动先看一眼云端，之后每分钟检查一次；断网恢复时也拉一次
+  ensureSyncFields();
+  setTimeout(autoPull, 2500);
+  setInterval(autoPull, 60000);
+  window.addEventListener('online', autoPull);
 }
 
 init();
